@@ -1,0 +1,46 @@
+repository	Repository structure and ownership
+architecture	Architecture and dependency boundaries
+modules	Packages modules and namespaces
+naming	Naming and formatting
+functions	Functions and public APIs
+interfaces	Interfaces and abstractions
+constructors	Constructors and dependency injection
+errors	Errors and failure handling
+domain	Domain models
+conversion	DTOs and data conversion
+services	Services and use cases
+persistence	Repositories and persistence
+transactions	Transactions
+queries	Database queries
+migrations	Database migrations
+transport	HTTP gRPC CLI and transport
+compatibility	API and schema compatibility
+validation	Input and domain validation
+authentication	Authentication
+authorization	Authorization
+security	Security controls
+configuration	Configuration
+secrets	Secret handling
+logging	Logging
+metrics	Metrics
+tracing	Tracing
+caching	Caching
+messaging	Messaging and event processing
+jobs	Background jobs
+concurrency	Concurrency
+resilience	Retries timeouts and circuit breakers
+idempotency	Idempotency
+helpers	Helpers and shared utilities
+testing	Testing
+fixtures	Test fixtures and mocks
+generation	Code generation
+build	Build and dependency management
+deployment	Deployment and infrastructure
+reliability	Reliability and graceful degradation
+performance	Performance
+documentation	Documentation
+decisions	Architecture decision records
+deprecation	Deprecation and migration
+workflow	Git and contribution workflow
+compliance	Compliance and data handling
+business	Project-specific business patterns

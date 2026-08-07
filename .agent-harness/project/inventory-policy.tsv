@@ -1,0 +1,7 @@
+ALLOW_SYMLINK	my_docs	Project-linked documentation mount is an intentional external directory and is audited as an exact approved symlink.	codex	2026-08-04T02:51:49Z
+ALLOW_SYMLINK	node_modules/.bin/codex	Package-manager executable symlink is an intentional in-repository dependency entry.	codex	2026-08-04T02:51:51Z
+ALLOW_SYMLINK	node_modules/.bin/codex-security	Package-manager executable symlink is an intentional in-repository dependency entry.	codex	2026-08-04T02:51:52Z
+ALLOW_SYMLINK	node_modules/.bin/extract-zip	Package-manager executable symlink is an intentional in-repository dependency entry.	codex	2026-08-04T02:51:53Z
+ALLOW_SYMLINK	node_modules/.bin/incur	Package-manager executable symlink is an intentional in-repository dependency entry.	codex	2026-08-04T02:51:54Z
+ALLOW_SYMLINK	node_modules/.bin/incur.src	Package-manager executable symlink is an intentional in-repository dependency entry.	codex	2026-08-04T02:51:55Z
+ALLOW_SYMLINK	node_modules/.bin/yaml	Package-manager executable symlink is an intentional in-repository dependency entry.	codex	2026-08-04T02:51:56Z

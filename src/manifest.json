@@ -1,0 +1,9 @@
+{
+  "id": "obsidian-scratch-cleanup",
+  "name": "Open With Obsidian - Scratch Cleanup",
+  "version": "0.2.0",
+  "minAppVersion": "1.0.0",
+  "description": "Safely cleans stale external-file scratch entries.",
+  "author": "Local repository",
+  "isDesktopOnly": true
+}

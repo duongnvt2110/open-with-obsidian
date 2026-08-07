@@ -1,0 +1,9 @@
+{
+  "scripts": {
+    "test": "node --test tests/*.test.js && scripts/test-swift.sh",
+    "check": "node --check src/main.js && node --check src/reconcile.js && node --check src/cleanup.js && bash -n scripts/*.sh && scripts/build-plugin.sh >/dev/null"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.1"
+  }
+}

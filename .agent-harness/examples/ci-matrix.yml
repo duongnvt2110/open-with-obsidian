@@ -1,0 +1,43 @@
+# Copy this file to .github/workflows/harness.yml to enable it.
+name: Harness validation
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  ubuntu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash --version
+      - run: ./.agent-harness/harness doctor
+      - run: ./.agent-harness/harness audit
+      - run: ./.agent-harness/harness test --full
+
+  macos-system-bash:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show system Bash
+        run: /bin/bash --version
+      - name: Validate with system Bash
+        shell: /bin/bash {0}
+        run: |
+          ./.agent-harness/harness doctor
+          ./.agent-harness/harness audit
+          ./.agent-harness/harness test --full
+
+  macos-modern-bash:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install modern Bash
+        run: brew install bash
+      - name: Validate with modern Bash
+        run: |
+          BASH_BIN="$(brew --prefix)/bin/bash"
+          "$BASH_BIN" --version
+          "$BASH_BIN" ./.agent-harness/harness doctor
+          "$BASH_BIN" ./.agent-harness/harness audit
+          "$BASH_BIN" ./.agent-harness/harness test --full

@@ -1,0 +1,10 @@
+.build/
+node_modules/
+.DS_Store
+*.app/
+
+# Local macOS and editor state
+.obsidian/
+.vscode/
+.idea/
+my_docs

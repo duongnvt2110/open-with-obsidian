@@ -1,0 +1,724 @@
+#!/usr/bin/env bash
+
+set -u
+set -o pipefail
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+REPOSITORY_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd -P)
+
+. "$SCRIPT_DIR/lib/common.sh"
+harness_normalize_locale
+. "$SCRIPT_DIR/lib/package.sh"
+. "$SCRIPT_DIR/lib/store.sh"
+. "$SCRIPT_DIR/lib/test_selection.sh"
+. "$SCRIPT_DIR/lib/inventory_policy.sh"
+. "$SCRIPT_DIR/lib/project_contract.sh"
+. "$SCRIPT_DIR/lib/identity.sh"
+. "$SCRIPT_DIR/lib/toolchain.sh"
+. "$SCRIPT_DIR/lib/policy.sh"
+. "$SCRIPT_DIR/lib/conventions.sh"
+. "$SCRIPT_DIR/lib/workflow.sh"
+. "$SCRIPT_DIR/lib/understanding.sh"
+. "$SCRIPT_DIR/lib/task.sh"
+. "$SCRIPT_DIR/lib/context.sh"
+. "$SCRIPT_DIR/lib/attestation.sh"
+. "$SCRIPT_DIR/lib/verify.sh"
+. "$SCRIPT_DIR/lib/audit.sh"
+
+harness_init_paths "$REPOSITORY_ROOT"
+HARNESS_EXECUTED_PACKAGE_DIGEST=$(package_tree_digest "$REPOSITORY_ROOT" installed) || harness_die 6 "installed package integrity validation failed"
+if [ -n "${HARNESS_DECLARED_PACKAGE_DIGEST:-}" ] && [ "$HARNESS_DECLARED_PACKAGE_DIGEST" != "$HARNESS_EXECUTED_PACKAGE_DIGEST" ]; then
+    harness_die 6 "declared package bytes differ from executed package bytes"
+fi
+export HARNESS_EXECUTED_PACKAGE_DIGEST
+trap cleanup_common EXIT INT TERM
+
+usage() {
+    cat <<'USAGE'
+Usage: .agent-harness/harness <command> [options]
+
+Task workflow:
+  status [--json]
+  next [--json] [--since SHA256] [--details]
+  task create --title T --goal G --stakeholders S [--profile P]
+              [--project-mode brownfield|greenfield]
+              [--risk low|medium|high|critical]
+              --criterion 'AC-ID|description' --scope 'path/**'
+              --check CHECK --coverage 'AC-ID|CHECK|EVIDENCE|rationale'
+              [--read 'path/**']
+  task understand --by NAME --current-behavior TEXT --entry-points TEXT
+                  --data-flow TEXT --dependencies TEXT --interface-impact TEXT
+                  --compatibility-risk TEXT --scope-rationale TEXT
+                  --check-rationale TEXT --rollback-plan TEXT
+                  --security-impact TEXT --data-impact TEXT
+                  --operational-impact TEXT --nfr-impact TEXT
+                  --module 'ID|rationale' --step TEXT
+                  [--assumption 'TEXT|CONFIRMED|REJECTED|OPEN']
+                  [--evidence 'TYPE|PATH|SYMBOL|RATIONALE']
+                  [--inspection-current | --inspection-skip-reason TEXT]
+  task show
+  task clarify --question TEXT
+  task answer --id ID --answer TEXT
+  task acknowledge --by NAME --reason TEXT
+  task amend --by NAME --reason TEXT
+  task cancel [--reason TEXT]
+  approve --by NAME [--second-by NAME]
+          [--identity-evidence FILE] [--second-identity-evidence FILE]
+  approve --final --by NAME [--identity-evidence FILE]
+          [--rule 'RULE|PASS|WAIVE|paths|rationale']
+  verify
+  context build|show
+  finalize
+  recover [--force-lock --reason TEXT --by NAME [--identity-evidence FILE]]
+
+Repository understanding and project authority:
+  inspect
+  project define --name N --goal G --success S --architecture A
+                 --technology-constraints T --data-model D --api-strategy API
+                 --security SEC --reliability REL --deployment DEPLOY
+                 --migration-strategy M --owner OWNER --by NAME
+  project architecture|nfr|decision|interface --id ID
+                 --a VALUE --b VALUE --c VALUE --d VALUE [--e VALUE] --by NAME
+  project validate
+
+Conventions and inventory:
+  conventions list|validate
+  conventions module add --id ID --root PATH --language LANG
+                         --framework NAME --owner TEAM --by NAME
+  conventions add --id ID --category C --level MUST|SHOULD|MAY
+                  --source DECLARED|EXTERNAL --path P --trigger T
+                  --enforcement AUTOMATED|MANUAL|MIXED|INFORMATIONAL
+                  [--module M] [--check CHECK] [--example PATH]
+                  [--language LIST] [--file-type LIST]
+                  [--task-profile LIST] [--risk LIST]
+                  [--phase PHASE] [--order N] --rule TEXT --by NAME
+  conventions candidate add --id ID --category C --level L
+                  --source OBSERVED|INFERRED --path P --observation OBS-ID
+                  --rule TEXT --by NAME
+  conventions promote --id ID --by NAME
+  conventions exception add --id ID --rule RULE --path P
+                  [--task TASK|*] [--expires RFC3339|NEVER]
+                  --reason TEXT --by NAME
+  conventions exception revoke --id ID --reason TEXT --by NAME
+  conventions replace --id OLD --with NEW --reason TEXT --by NAME
+  conventions deprecate --id ID --reason TEXT --by NAME
+  inventory policy add|remove --type TYPE --path PATTERN
+                  --reason TEXT --by NAME
+
+Assurance and diagnostics:
+  identity policy set --mode DECLARATIVE|OS_USER|ENVIRONMENT|EXTERNAL
+                  [--env-key KEY] --by NAME
+  anchor configure --file ABSOLUTE_PATH --by NAME
+  attest verify FILE
+  audit [--json]
+  doctor
+  test [--gate fast|lifecycle|adversarial|release] [--full]
+       [--mode focused|standard|full|auto] [--suite NAME]
+       [--since GIT_REF] [--explain]
+       [--filter CASE[,CASE...]] [--json] [--verbose]
+  help
+
+Verification command configuration supports PHASE, ORDER, ENV_ALLOW_n,
+TOOL_n, OUTPUT_n for PREPARE checks, GIT_MODE, TOOLCHAIN_MODE, ARG_n, and
+TRUSTED_INPUT_n. Normal tasks cannot modify .agent-harness/**, AGENTS.md,
+WORKFLOW.md, or CONTEXT.md.
+USAGE
+}
+
+
+validate_cli_option_arity() {
+    local option
+    while [ "$#" -gt 0 ]; do
+        option=$1
+        case "$option" in
+            --json|--final|--inspection-current|--full|--force-lock|--strict|--verbose|--details|--explain) shift ;;
+            --*) [ "$#" -ge 2 ] || harness_die 2 "$option requires a value"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+}
+
+strip_json_flag() {
+    FILTERED_ARGS=()
+    for item in "$@"; do
+        if [ "$item" = "--json" ]; then HARNESS_JSON_MODE=1; else FILTERED_ARGS+=("$item"); fi
+    done
+}
+
+task_create_cli() {
+    local title goal stakeholders profile project_mode risk criteria scopes reads checks coverage criterion_id description old_ifs ac check evidence rationale result status task_id run_id IFS
+    IFS=$' \t\n'
+    title=""; goal=""; stakeholders=""; profile="bugfix"; project_mode="brownfield"; risk="medium"
+    criteria=$(mktemp "${TMPDIR:-/tmp}/criteria.XXXXXX") || harness_die 2 "cannot create temporary file"
+    scopes=$(mktemp "${TMPDIR:-/tmp}/scopes.XXXXXX") || harness_die 2 "cannot create temporary file"
+    reads=$(mktemp "${TMPDIR:-/tmp}/reads.XXXXXX") || harness_die 2 "cannot create temporary file"
+    checks=$(mktemp "${TMPDIR:-/tmp}/checks.XXXXXX") || harness_die 2 "cannot create temporary file"
+    coverage=$(mktemp "${TMPDIR:-/tmp}/coverage.XXXXXX") || harness_die 2 "cannot create temporary file"
+    : >"$criteria"; : >"$scopes"; : >"$reads"; : >"$checks"; : >"$coverage"
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --title) [ "$#" -ge 2 ] || harness_die 2 "--title requires a value"; title=$2; shift 2 ;;
+            --goal) [ "$#" -ge 2 ] || harness_die 2 "--goal requires a value"; goal=$2; shift 2 ;;
+            --stakeholders) [ "$#" -ge 2 ] || harness_die 2 "--stakeholders requires a value"; stakeholders=$2; shift 2 ;;
+            --profile) [ "$#" -ge 2 ] || harness_die 2 "--profile requires a value"; profile=$2; shift 2 ;;
+            --project-mode) [ "$#" -ge 2 ] || harness_die 2 "--project-mode requires a value"; project_mode=$2; shift 2 ;;
+            --risk) [ "$#" -ge 2 ] || harness_die 2 "--risk requires a value"; risk=$2; shift 2 ;;
+            --criterion)
+                [ "$#" -ge 2 ] || harness_die 2 "--criterion requires ID|description"
+                criterion_id=${2%%|*}; description=${2#*|}
+                [ "$criterion_id" != "$2" ] || harness_die 2 "criterion must use ID|description"
+                printf '%s\t%s\n' "$criterion_id" "$(printf '%s' "$description" | tr '\t\r\n' '   ')" >>"$criteria"
+                shift 2 ;;
+            --scope) [ "$#" -ge 2 ] || harness_die 2 "--scope requires a value"; printf '%s\n' "$2" >>"$scopes"; shift 2 ;;
+            --read) [ "$#" -ge 2 ] || harness_die 2 "--read requires a value"; printf '%s\n' "$2" >>"$reads"; shift 2 ;;
+            --check) [ "$#" -ge 2 ] || harness_die 2 "--check requires a command ID"; printf '%s\n' "$2" >>"$checks"; shift 2 ;;
+            --coverage)
+                [ "$#" -ge 2 ] || harness_die 2 "--coverage requires AC|CHECK|EVIDENCE|rationale"
+                old_ifs=$IFS; IFS='|' read -r ac check evidence rationale <<EOF_COVERAGE
+$2
+EOF_COVERAGE
+                IFS=$old_ifs
+                [ -n "$ac" ] && [ -n "$check" ] && [ -n "$evidence" ] && [ -n "$rationale" ] || harness_die 2 "invalid coverage value"
+                printf '%s\t%s\t%s\t%s\n' "$ac" "$check" "$evidence" "$(printf '%s' "$rationale" | tr '\t\r\n' '   ')" >>"$coverage"
+                shift 2 ;;
+            *) harness_die 2 "unknown task create option: $1" ;;
+        esac
+    done
+    [ -n "$(trim_space "$title")" ] || harness_die 2 "title is required"
+    [ -n "$(trim_space "$goal")" ] || harness_die 2 "goal is required"
+    [ -n "$(trim_space "$stakeholders")" ] || harness_die 2 "stakeholders are required"
+    case "$project_mode" in brownfield|greenfield) ;; *) harness_die 2 "invalid project mode" ;; esac
+    case "$risk" in low|medium|high|critical) ;; *) harness_die 2 "invalid risk" ;; esac
+    [ -s "$reads" ] || cp "$scopes" "$reads"
+    acquire_lock "$HARNESS_GLOBAL_LOCK" task-create || harness_die 3 "another harness operation is running"
+    result=$(task_create_from_files "$title" "$goal" "$stakeholders" "$profile" "$criteria" "$scopes" "$reads" "$checks" "$coverage" "" "$project_mode" "$risk")
+    status=$?
+    release_lock
+    rm -f "$criteria" "$scopes" "$reads" "$checks" "$coverage"
+    case "$status" in
+        0) task_id=$(printf '%s' "$result" | awk -F '\t' '{print $1}'); run_id=$(printf '%s' "$result" | awk -F '\t' '{print $2}') ;;
+        2) harness_die 3 "an active task already exists" ;;
+        3) harness_die 2 "the task contract is invalid" ;;
+        *) harness_die 4 "task creation failed" ;;
+    esac
+    if [ "$HARNESS_JSON_MODE" = "1" ]; then
+        printf '{"task_id":"%s","run_id":"%s","state":"INTAKE"}\n' "$(json_escape "$task_id")" "$(json_escape "$run_id")"
+    else
+        printf 'Created task %s with run %s\n' "$task_id" "$run_id"
+    fi
+}
+
+task_understand_cli() {
+    local approved_by current_behavior entry_points data_flow dependencies interface_impact compatibility_risk scope_rationale check_rationale rollback_plan security_impact data_impact operational_impact nfr_impact
+    local modules assumptions steps evidence module_seq assumption_seq step_seq evidence_seq inspection_mode inspection_skip old_ifs module_id rationale statement assumption_status claim_type claim_path claim_symbol claim_rationale task_id run_id
+    approved_by=""; current_behavior=""; entry_points=""; data_flow=""; dependencies=""; interface_impact=""
+    compatibility_risk=""; scope_rationale=""; check_rationale=""; rollback_plan=""; security_impact=""
+    data_impact=""; operational_impact=""; nfr_impact=""; inspection_mode=""; inspection_skip=""
+    modules=$(mktemp "${TMPDIR:-/tmp}/understanding-modules.XXXXXX") || harness_die 2 "cannot create modules input"
+    assumptions=$(mktemp "${TMPDIR:-/tmp}/understanding-assumptions.XXXXXX") || harness_die 2 "cannot create assumptions input"
+    steps=$(mktemp "${TMPDIR:-/tmp}/understanding-steps.XXXXXX") || harness_die 2 "cannot create steps input"
+    evidence=$(mktemp "${TMPDIR:-/tmp}/understanding-evidence.XXXXXX") || harness_die 2 "cannot create evidence input"
+    : >"$modules"; : >"$assumptions"; : >"$steps"; : >"$evidence"
+    module_seq=0; assumption_seq=0; step_seq=0; evidence_seq=0
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --by) [ "$#" -ge 2 ] || harness_die 2 "--by requires a value"; approved_by=$2; shift 2 ;;
+            --current-behavior) current_behavior=$2; shift 2 ;;
+            --entry-points) entry_points=$2; shift 2 ;;
+            --data-flow) data_flow=$2; shift 2 ;;
+            --dependencies) dependencies=$2; shift 2 ;;
+            --interface-impact) interface_impact=$2; shift 2 ;;
+            --compatibility-risk) compatibility_risk=$2; shift 2 ;;
+            --scope-rationale) scope_rationale=$2; shift 2 ;;
+            --check-rationale) check_rationale=$2; shift 2 ;;
+            --rollback-plan) rollback_plan=$2; shift 2 ;;
+            --security-impact) security_impact=$2; shift 2 ;;
+            --data-impact) data_impact=$2; shift 2 ;;
+            --operational-impact) operational_impact=$2; shift 2 ;;
+            --nfr-impact) nfr_impact=$2; shift 2 ;;
+            --inspection-current) inspection_mode=CURRENT; shift ;;
+            --inspection-skip-reason) [ "$#" -ge 2 ] || harness_die 2 "--inspection-skip-reason requires a value"; inspection_mode=SKIP; inspection_skip=$2; shift 2 ;;
+            --module)
+                old_ifs=$IFS; IFS='|' read -r module_id rationale <<EOF_MODULE
+$2
+EOF_MODULE
+                IFS=$old_ifs
+                [ -n "$module_id" ] && [ -n "$rationale" ] || harness_die 2 "--module requires ID|rationale"
+                identifier_validate "$module_id" || harness_die 2 "invalid module identifier"
+                printf '%s\t%s\n' "$module_id" "$(printf '%s' "$rationale" | tr '\t\r\n' '   ')" >>"$modules"
+                shift 2 ;;
+            --assumption)
+                old_ifs=$IFS; IFS='|' read -r statement assumption_status <<EOF_ASSUMPTION
+$2
+EOF_ASSUMPTION
+                IFS=$old_ifs
+                [ -n "$statement" ] || harness_die 2 "--assumption requires TEXT|STATUS"
+                [ -n "$assumption_status" ] || assumption_status=OPEN
+                assumption_seq=$((assumption_seq + 1))
+                printf 'ASM-%03d\t%s\t%s\n' "$assumption_seq" "$(printf '%s' "$statement" | tr '\t\r\n' '   ')" "$assumption_status" >>"$assumptions"
+                shift 2 ;;
+            --step)
+                step_seq=$((step_seq + 1))
+                printf 'STEP-%03d\t%s\n' "$step_seq" "$(printf '%s' "$2" | tr '\t\r\n' '   ')" >>"$steps"
+                shift 2 ;;
+            --evidence)
+                old_ifs=$IFS; IFS='|' read -r claim_type claim_path claim_symbol claim_rationale <<EOF_EVIDENCE
+$2
+EOF_EVIDENCE
+                IFS=$old_ifs
+                [ -n "$claim_type" ] && [ -n "$claim_path" ] && [ -n "$claim_rationale" ] || harness_die 2 "--evidence requires TYPE|PATH|SYMBOL|RATIONALE"
+                evidence_seq=$((evidence_seq + 1))
+                printf 'UND-%03d\t%s\t%s\t%s\t%s\n' "$evidence_seq" "$claim_type" "$claim_path" "${claim_symbol:--}" "$(printf '%s' "$claim_rationale" | tr '\t\r\n' '   ')" >>"$evidence"
+                shift 2 ;;
+            *) rm -f "$modules" "$assumptions" "$steps" "$evidence"; harness_die 2 "unknown task understand option: $1" ;;
+        esac
+    done
+    run_id=$(active_run_id 2>/dev/null) || { rm -f "$modules" "$assumptions" "$steps" "$evidence"; harness_die 3 "no active task"; }
+    task_id=$(state_get "$run_id" TASK_ID)
+    if [ -z "$inspection_mode" ]; then
+        if [ "$(conf_get "$(task_dir "$task_id")/understanding.conf" PROJECT_MODE)" = brownfield ]; then
+            rm -f "$modules" "$assumptions" "$steps" "$evidence"
+            harness_die 2 "brownfield understanding requires --inspection-current or --inspection-skip-reason"
+        fi
+        inspection_mode=NONE
+    fi
+    task_record_understanding "$task_id" "$approved_by" "$current_behavior" "$entry_points" "$data_flow" "$dependencies" "$interface_impact" "$compatibility_risk" "$scope_rationale" "$check_rationale" "$rollback_plan" "$security_impact" "$data_impact" "$operational_impact" "$nfr_impact" "$modules" "$assumptions" "$steps" "$evidence" "$inspection_mode" "$inspection_skip" || {
+        rm -f "$modules" "$assumptions" "$steps" "$evidence"; harness_die 3 "repository understanding is incomplete or invalid";
+    }
+    rm -f "$modules" "$assumptions" "$steps" "$evidence"
+    printf 'Repository understanding recorded for %s\n' "$task_id"
+}
+
+task_show_cli() {
+    local run_id task_id directory convention_count
+    run_id=$(active_run_id 2>/dev/null) || harness_die 3 "no active task"
+    task_id=$(state_get "$run_id" TASK_ID)
+    directory=$(task_dir "$task_id")
+    convention_count=$(awk 'NF {count++} END {print count+0}' "$directory/applicable-conventions.tsv" 2>/dev/null || printf 0)
+    printf 'Task: %s\nTitle: %s\nGoal: %s\nProfile: %s\nState: %s\nApplicable conventions: %s\n' \
+        "$task_id" "$(conf_get "$directory/spec.conf" TITLE)" "$(conf_get "$directory/spec.conf" GOAL)" \
+        "$(conf_get "$directory/plan.conf" PROFILE)" "$(state_get "$run_id" STATE)" "$convention_count"
+}
+
+convention_rule_cli() {
+    local mode rule_id category level source module_id path_pattern trigger enforcement check_id example_path rule_text approved_by languages file_types profiles risks phase order observation_id
+    mode=$1; shift
+    rule_id=""; category=""; level=""; source="DECLARED"; module_id="*"; path_pattern=""; trigger="ANY"; enforcement="MANUAL"; check_id=""; example_path=""; rule_text=""; approved_by=""
+    languages="*"; file_types="*"; profiles="*"; risks="*"; phase="TEST"; order="100"; observation_id=""
+    [ "$mode" = "candidate" ] && source="OBSERVED"
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --id) rule_id=$2; shift 2 ;; --category) category=$2; shift 2 ;; --level) level=$2; shift 2 ;;
+            --source) source=$2; shift 2 ;; --module) module_id=$2; shift 2 ;; --path) path_pattern=$2; shift 2 ;;
+            --trigger) trigger=$2; shift 2 ;; --enforcement) enforcement=$2; shift 2 ;; --check) check_id=$2; shift 2 ;;
+            --example) example_path=$2; shift 2 ;; --rule) rule_text=$2; shift 2 ;; --by) approved_by=$2; shift 2 ;;
+            --language) languages=$2; shift 2 ;; --file-type) file_types=$2; shift 2 ;; --task-profile) profiles=$2; shift 2 ;;
+            --risk) risks=$2; shift 2 ;; --phase) phase=$2; shift 2 ;; --order) order=$2; shift 2 ;; --observation) observation_id=$2; shift 2 ;;
+            *) harness_die 2 "unknown convention rule option: $1" ;;
+        esac
+    done
+    [ -n "$rule_id" ] && [ -n "$category" ] && [ -n "$level" ] && [ -n "$path_pattern" ] && [ -n "$rule_text" ] && [ -n "$approved_by" ] || harness_die 2 "convention rule is missing required values"
+    if [ "$mode" = "active" ]; then
+        case "$source" in DECLARED|EXTERNAL) ;; *) harness_die 2 "active rules require DECLARED or EXTERNAL source" ;; esac
+        conventions_add_rule "$rule_id" "$category" "$level" "$source" "$module_id" "$path_pattern" "$trigger" "$enforcement" "$check_id" "$example_path" "$rule_text" "$approved_by" "$languages" "$file_types" "$profiles" "$risks" "$phase" "$order" || harness_die 3 "convention rule could not be added"
+        printf 'Added convention %s\n' "$rule_id"
+    else
+        case "$source" in OBSERVED|INFERRED) ;; *) harness_die 2 "candidate rules require OBSERVED or INFERRED source" ;; esac
+        [ -n "$observation_id" ] || harness_die 2 "candidate rules require --observation OBS-ID"
+        conventions_add_candidate "$rule_id" "$category" "$level" "$source" "$module_id" "$path_pattern" "$trigger" "$enforcement" "$check_id" "$example_path" "$rule_text" "$approved_by" "$languages" "$file_types" "$profiles" "$risks" "$phase" "$order" "$observation_id" || harness_die 3 "convention candidate could not be added"
+        printf 'Added convention candidate %s\n' "$rule_id"
+    fi
+}
+
+run_public_tests() {
+    local test_script output status filter verbose gate mode suite since explain artifact_root artifact bytes digest result label
+    test_script=$HARNESS_DIR/tests/run.sh
+    [ -x "$test_script" ] || harness_die 6 "consumer test suite is missing"
+    gate=''; mode=''; filter=''; suite=''; since=''; verbose=0; explain=0
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --full) [ -z "$gate$mode" ] || harness_die 2 "--full conflicts with another gate or mode"; mode=full; shift ;;
+            --gate)
+                [ "$#" -ge 2 ] || harness_die 2 "--gate requires fast, lifecycle, adversarial, or release"
+                case "$2" in fast|lifecycle|adversarial|release) ;; *) harness_die 2 "invalid test gate: $2" ;; esac
+                [ -z "$gate$mode" ] || harness_die 2 "--gate conflicts with another gate or mode"
+                gate=$2; shift 2 ;;
+            --mode)
+                [ "$#" -ge 2 ] || harness_die 2 "--mode requires focused, standard, full, or auto"
+                test_mode_valid "$2" || harness_die 2 "invalid test mode: $2"
+                [ -z "$gate$mode" ] || harness_die 2 "--mode conflicts with another gate or mode"
+                mode=$2; shift 2 ;;
+            --suite) [ "$#" -ge 2 ] || harness_die 2 "--suite requires a value"; suite=$2; shift 2 ;;
+            --since) [ "$#" -ge 2 ] || harness_die 2 "--since requires a Git reference"; since=$2; shift 2 ;;
+            --explain) explain=1; shift ;;
+            --filter) [ "$#" -ge 2 ] || harness_die 2 "--filter requires a comma-separated case list"; filter=$2; shift 2 ;;
+            --verbose) verbose=1; shift ;;
+            *) harness_die 2 "unknown test option: $1" ;;
+        esac
+    done
+
+    output=$(mktemp "${TMPDIR:-/tmp}/harness-public-tests.XXXXXX") || harness_die 6 "cannot create test output"
+    set --
+    if [ -n "$mode" ]; then set -- "$@" --mode "$mode"; elif [ -n "$gate" ]; then set -- "$@" --gate "$gate"; fi
+    [ -z "$suite" ] || set -- "$@" --suite "$suite"
+    [ -z "$since" ] || set -- "$@" --since "$since"
+    [ "$explain" -eq 0 ] || set -- "$@" --explain
+    [ -z "$filter" ] || set -- "$@" --filter "$filter"
+    [ "$HARNESS_JSON_MODE" = 1 ] && set -- "$@" --json
+
+    bash "$test_script" "$@" >"$output" 2>&1
+    status=$?
+    if [ "$status" -eq 0 ]; then
+        if [ "$verbose" -eq 1 ] || [ "$explain" -eq 1 ]; then cat "$output"; else tail -n 1 "$output"; fi
+        rm -f "$output"
+        return 0
+    fi
+
+    label=${mode:-${gate:-fast}}
+    artifact_root=${HARNESS_TEST_ARTIFACT_DIR:-${TMPDIR:-/tmp}/agent-harness-test-artifacts}
+    [ ! -L "$artifact_root" ] || { rm -f "$output"; harness_die 6 "test artifact directory must not be a symlink"; }
+    mkdir -p "$artifact_root" || { rm -f "$output"; harness_die 6 "cannot create test artifact directory"; }
+    chmod 700 "$artifact_root" 2>/dev/null || true
+    artifact=$(mktemp "$artifact_root/test-$label.XXXXXX") || { rm -f "$output"; harness_die 6 "cannot create test artifact"; }
+    mv "$output" "$artifact" || { rm -f "$output" "$artifact"; harness_die 6 "cannot retain test artifact"; }
+    chmod 600 "$artifact" 2>/dev/null || true
+    bytes=$(wc -c <"$artifact" | tr -d ' ')
+    digest=$(sha256_file "$artifact") || harness_die 6 "cannot hash test artifact"
+    if [ "$verbose" -eq 1 ]; then
+        cat "$artifact"
+    elif [ "$HARNESS_JSON_MODE" = "1" ]; then
+        result=FAIL; [ "$status" -ne 2 ] || result=ERROR
+        printf '{"result":"%s","mode":"%s","gate":"%s","exit_code":%s,"summary":"test execution failed; inspect the retained artifact","artifact":{"path":"%s","bytes":%s,"sha256":"%s"}}\n' \
+            "$result" "$(json_escape "${mode:-legacy-gate}")" "$(json_escape "${gate:-$label}")" "$status" "$(json_escape "$artifact")" "$bytes" "$digest"
+    else
+        printf 'Test selection: %s\nResult: FAIL\nExit code: %s\nFull output: %s\nOutput bytes: %s\nOutput SHA-256: %s\n' \
+            "$label" "$status" "$artifact" "$bytes" "$digest"
+    fi
+    return "$status"
+}
+
+validate_cli_option_arity "$@"
+strip_json_flag "$@"
+set -- "${FILTERED_ARGS[@]}"
+command_name=${1:-help}
+[ "$#" -eq 0 ] || shift
+
+# Read-only commands must not materialize runtime or project state. Mutating
+# commands initialize the repository-owned data layout explicitly.
+case "$command_name" in
+    status|next|audit|doctor|test|help|-h|--help) ;;
+    context)
+        [ "${1:-show}" = "show" ] || harness_ensure_layout || harness_die 4 "cannot initialize harness data layout"
+        ;;
+    *) harness_ensure_layout || harness_die 4 "cannot initialize harness data layout" ;;
+esac
+
+case "$command_name" in
+    status) workflow_status ;;
+    next) workflow_next "$@" ;;
+    task)
+        sub=${1:-}
+        [ "$#" -eq 0 ] || shift
+        case "$sub" in
+            create) task_create_cli "$@" ;;
+            understand) task_understand_cli "$@" ;;
+            show) task_show_cli ;;
+            approval-subject)
+                [ "$#" -eq 0 ] || harness_die 2 "task approval-subject takes no options"
+                task_prepare_approval_subject || harness_die 3 "approval subject could not be prepared"
+                ;;
+            clarify)
+                [ "${1:-}" = "--question" ] && [ "$#" -ge 2 ] || harness_die 2 "task clarify requires --question"
+                id=$(task_request_clarification "$2") || harness_die 3 "clarification request failed"
+                printf 'Question ID: %s\n' "$id" ;;
+            answer)
+                question_id=""; answer=""
+                while [ "$#" -gt 0 ]; do case "$1" in --id) question_id=$2; shift 2 ;; --answer) answer=$2; shift 2 ;; *) harness_die 2 "unknown answer option" ;; esac; done
+                [ -n "$question_id" ] && [ -n "$answer" ] || harness_die 2 "task answer requires --id and --answer"
+                task_answer_clarification "$question_id" "$answer" || harness_die 3 "clarification answer failed" ;;
+            acknowledge)
+                approved_by=""; reason=""
+                while [ "$#" -gt 0 ]; do case "$1" in --by) approved_by=$2; shift 2 ;; --reason) reason=$2; shift 2 ;; *) harness_die 2 "unknown task acknowledge option" ;; esac; done
+                [ -n "$approved_by" ] && [ -n "$reason" ] || harness_die 2 "task acknowledge requires --by and --reason"
+                task_acknowledge_hold "$approved_by" "$reason" || harness_die 3 "task hold could not be acknowledged"
+                ;;
+            amend)
+                approved_by=""; reason=""
+                while [ "$#" -gt 0 ]; do case "$1" in --by) approved_by=$2; shift 2 ;; --reason) reason=$2; shift 2 ;; *) harness_die 2 "unknown task amend option" ;; esac; done
+                [ -n "$approved_by" ] && [ -n "$reason" ] || harness_die 2 "task amend requires --by and --reason"
+                result=$(task_amend "$approved_by" "$reason") || harness_die 3 "task amendment failed"
+                printf 'Created amended task %s with run %s
+' "$(printf '%s' "$result" | awk -F '\t' '{print $1}')" "$(printf '%s' "$result" | awk -F '\t' '{print $2}')"
+                ;;
+            cancel)
+                reason="cancelled by human"
+                if [ "${1:-}" = "--reason" ] && [ "$#" -ge 2 ]; then reason=$2; fi
+                task_cancel "$reason" || harness_die 3 "task cancellation failed" ;;
+            *) harness_die 2 "unknown task command: $sub" ;;
+        esac
+        ;;
+    approve)
+        final=0; approved_by=""; second_approved_by=""; identity_evidence=""; second_identity_evidence=""
+        review_file=$(mktemp "${TMPDIR:-/tmp}/convention-review-input.XXXXXX") || harness_die 2 "cannot create review input"
+        : >"$review_file"
+        while [ "$#" -gt 0 ]; do
+            case "$1" in
+                --final) final=1; shift ;;
+                --by) [ "$#" -ge 2 ] || harness_die 2 "--by requires a value"; approved_by=$2; shift 2 ;;
+                --second-by) [ "$#" -ge 2 ] || harness_die 2 "--second-by requires a value"; second_approved_by=$2; shift 2 ;;
+                --identity-evidence) [ "$#" -ge 2 ] || harness_die 2 "--identity-evidence requires a file"; identity_evidence=$2; shift 2 ;;
+                --second-identity-evidence) [ "$#" -ge 2 ] || harness_die 2 "--second-identity-evidence requires a file"; second_identity_evidence=$2; shift 2 ;;
+                --rule)
+                    [ "$#" -ge 2 ] || harness_die 2 "--rule requires RULE|PASS|paths|rationale"
+                    old_ifs=$IFS; IFS='|' read -r rule_id decision reviewed_paths rationale <<EOF_REVIEW
+$2
+EOF_REVIEW
+                    IFS=$old_ifs
+                    [ -n "$rule_id" ] && [ -n "$decision" ] && [ -n "$reviewed_paths" ] && [ -n "$rationale" ] || harness_die 2 "invalid --rule review"
+                    printf '%s	%s	%s	%s
+' "$rule_id" "$decision" "$(printf '%s' "$reviewed_paths" | tr '	
+' '   ')" "$(printf '%s' "$rationale" | tr '	
+' '   ')" >>"$review_file"
+                    shift 2 ;;
+                *) harness_die 2 "unknown approve option" ;;
+            esac
+        done
+        [ -n "$approved_by" ] || harness_die 2 "approve requires --by"
+        if [ "$final" -eq 1 ]; then
+            approve_final_review "$approved_by" "$review_file" "$identity_evidence" || { rm -f "$review_file"; harness_die 3 "final review approval failed"; }
+        else
+            [ ! -s "$review_file" ] || { rm -f "$review_file"; harness_die 2 "--rule is valid only with --final"; }
+            approve_task "$approved_by" "$second_approved_by" "$identity_evidence" "$second_identity_evidence" || { rm -f "$review_file"; harness_die 3 "task approval failed"; }
+        fi
+        rm -f "$review_file"
+        ;;
+    project)
+        sub=${1:-}; [ "$#" -eq 0 ] || shift
+        case "$sub" in
+            define)
+                name=""; goal=""; success=""; architecture=""; technology=""; data_model=""; api_strategy=""; security=""; reliability=""; deployment=""; migration=""; owner=""; approved_by=""
+                while [ "$#" -gt 0 ]; do case "$1" in
+                    --name) name=$2; shift 2 ;; --goal) goal=$2; shift 2 ;; --success) success=$2; shift 2 ;;
+                    --architecture) architecture=$2; shift 2 ;; --technology-constraints) technology=$2; shift 2 ;; --data-model) data_model=$2; shift 2 ;; --api-strategy) api_strategy=$2; shift 2 ;;
+                    --security) security=$2; shift 2 ;; --reliability) reliability=$2; shift 2 ;; --deployment) deployment=$2; shift 2 ;; --migration-strategy) migration=$2; shift 2 ;;
+                    --owner) owner=$2; shift 2 ;; --by) approved_by=$2; shift 2 ;;
+                    *) harness_die 2 "unknown project define option: $1" ;; esac; done
+                [ -n "$name$goal$success$architecture$technology$data_model$api_strategy$security$reliability$deployment$migration$owner$approved_by" ] || harness_die 2 "project define is missing required values"
+                project_define "$name" "$goal" "$success" "$architecture" "$technology" "$data_model" "$api_strategy" "$security" "$reliability" "$deployment" "$migration" "$owner" "$approved_by" || harness_die 3 "project contract could not be defined"
+                printf 'Project contract defined\n' ;;
+            architecture|nfr|decision|interface)
+                kind=$sub; id=""; a=""; b=""; c=""; d=""; e="-"; approved_by=""
+                while [ "$#" -gt 0 ]; do case "$1" in --id) id=$2; shift 2 ;; --a) a=$2; shift 2 ;; --b) b=$2; shift 2 ;; --c) c=$2; shift 2 ;; --d) d=$2; shift 2 ;; --e) e=$2; shift 2 ;; --by) approved_by=$2; shift 2 ;; *) harness_die 2 "unknown project record option: $1" ;; esac; done
+                [ -n "$id$a$b$c$d$approved_by" ] || harness_die 2 "project $kind is missing required values"
+                project_add_record "$kind" "$id" "$a" "$b" "$c" "$d" "$e" "$approved_by" || harness_die 3 "project record could not be added"
+                printf 'Added project %s %s\n' "$kind" "$id" ;;
+            validate) project_contract_validate || harness_die 6 "project contract is invalid"; printf 'Project contract: PASS\n' ;;
+            *) harness_die 2 "unknown project command: $sub" ;;
+        esac
+        ;;
+    identity)
+        [ "${1:-}" = policy ] || harness_die 2 "identity supports policy set"
+        shift; [ "${1:-}" = set ] || harness_die 2 "identity supports policy set"; shift
+        mode=""; env_key="-"; approved_by=""; verifier="-"; issuer="-"
+        while [ "$#" -gt 0 ]; do
+            case "$1" in
+                --mode) mode=$2; shift 2 ;;
+                --env-key) env_key=$2; shift 2 ;;
+                --verifier) verifier=$2; shift 2 ;;
+                --issuer) issuer=$2; shift 2 ;;
+                --by) approved_by=$2; shift 2 ;;
+                *) harness_die 2 "unknown identity option: $1" ;;
+            esac
+        done
+        [ -n "$mode" ] && [ -n "$approved_by" ] || harness_die 2 "identity policy set requires --mode and --by"
+        identity_set_policy "$mode" "$env_key" "$approved_by" "$verifier" "$issuer" || harness_die 3 "identity policy could not be changed"
+        printf 'Identity policy set to %s\n' "$mode"
+        ;;
+    anchor)
+        [ "${1:-}" = configure ] || harness_die 2 "anchor supports configure"; shift
+        path=""; adapter=""; approved_by=""
+        while [ "$#" -gt 0 ]; do
+            case "$1" in
+                --file) path=$2; shift 2 ;;
+                --adapter) adapter=$2; shift 2 ;;
+                --by) approved_by=$2; shift 2 ;;
+                *) harness_die 2 "unknown anchor option: $1" ;;
+            esac
+        done
+        [ -n "$approved_by" ] || harness_die 2 "anchor configure requires --by"
+        if [ -n "$path" ] && [ -z "$adapter" ]; then
+            external_anchor_configure_local "$path" "$approved_by" || harness_die 3 "local external anchor could not be configured"
+            printf 'Local external anchor configured\n'
+        elif [ -n "$adapter" ] && [ -z "$path" ]; then
+            external_anchor_configure_adapter "$adapter" "$approved_by" || harness_die 3 "external anchor adapter could not be configured"
+            printf 'External anchor adapter configured\n'
+        else
+            harness_die 2 "anchor configure requires exactly one of --file or --adapter"
+        fi
+        ;;
+    attest)
+        action=${1:-verify}; [ "$#" -eq 0 ] || shift
+        case "$action" in
+            verify) file=${1:-}; [ -n "$file" ] || harness_die 2 "attest verify requires a file"; attestation_verify "$file" || harness_die 6 "attestation is invalid"; printf 'Attestation: PASS\n' ;;
+            *) harness_die 2 "unknown attest command: $action" ;;
+        esac
+        ;;
+    inspect)
+        [ "$#" -eq 0 ] || harness_die 2 "inspect takes no options"
+        report=$(conventions_inspect_repository) || harness_die 3 "repository inspection failed"
+        printf 'Inspection report: %s
+' "${report#"$HARNESS_REPO_ROOT/"}"
+        ;;
+    conventions)
+        sub=${1:-list}
+        [ "$#" -eq 0 ] || shift
+        case "$sub" in
+            list) [ "$#" -eq 0 ] || harness_die 2 "conventions list takes no options"; conventions_list ;;
+            validate) [ "$#" -eq 0 ] || harness_die 2 "conventions validate takes no options"; conventions_validate || harness_die 6 "convention contract is invalid"; printf 'Conventions: PASS
+' ;;
+            module)
+                action=${1:-}
+                [ "$#" -eq 0 ] || shift
+                [ "$action" = "add" ] || harness_die 2 "conventions module supports only add"
+                module_id=""; root_path=""; language="-"; framework="-"; owner=""; approved_by=""
+                while [ "$#" -gt 0 ]; do
+                    case "$1" in
+                        --id) module_id=$2; shift 2 ;; --root) root_path=$2; shift 2 ;; --language) language=$2; shift 2 ;;
+                        --framework) framework=$2; shift 2 ;; --owner) owner=$2; shift 2 ;; --by) approved_by=$2; shift 2 ;;
+                        *) harness_die 2 "unknown conventions module add option: $1" ;;
+                    esac
+                done
+                [ -n "$module_id" ] && [ -n "$root_path" ] && [ -n "$owner" ] && [ -n "$approved_by" ] || harness_die 2 "conventions module add is missing required values"
+                conventions_add_module "$module_id" "$root_path" "$language" "$framework" "$owner" "$approved_by" || harness_die 3 "convention module could not be added"
+                printf 'Added convention module %s
+' "$module_id"
+                ;;
+            add)
+                convention_rule_cli active "$@"
+                ;;
+            candidate)
+                action=${1:-}; [ "$#" -eq 0 ] || shift
+                [ "$action" = "add" ] || harness_die 2 "conventions candidate supports only add"
+                convention_rule_cli candidate "$@"
+                ;;
+            promote)
+                rule_id=""; approved_by=""
+                while [ "$#" -gt 0 ]; do case "$1" in --id) rule_id=$2; shift 2 ;; --by) approved_by=$2; shift 2 ;; *) harness_die 2 "unknown conventions promote option" ;; esac; done
+                [ -n "$rule_id" ] && [ -n "$approved_by" ] || harness_die 2 "conventions promote requires --id and --by"
+                conventions_promote_rule "$rule_id" "$approved_by" || harness_die 3 "candidate could not be promoted"
+                printf 'Promoted convention %s\n' "$rule_id"
+                ;;
+            exception)
+                action=${1:-}; [ "$#" -eq 0 ] || shift
+                case "$action" in
+                    add)
+                        exception_id=""; rule_id=""; path_pattern=""; task_id="*"; expires_at="NEVER"; reason=""; approved_by=""
+                        while [ "$#" -gt 0 ]; do case "$1" in
+                            --id) exception_id=$2; shift 2 ;; --rule) rule_id=$2; shift 2 ;; --path) path_pattern=$2; shift 2 ;;
+                            --task) task_id=$2; shift 2 ;; --expires) expires_at=$2; shift 2 ;; --reason) reason=$2; shift 2 ;;
+                            --by) approved_by=$2; shift 2 ;; *) harness_die 2 "unknown exception add option" ;;
+                        esac; done
+                        [ -n "$exception_id" ] && [ -n "$rule_id" ] && [ -n "$path_pattern" ] && [ -n "$reason" ] && [ -n "$approved_by" ] || harness_die 2 "exception add is missing required values"
+                        conventions_add_exception "$exception_id" "$rule_id" "$path_pattern" "$task_id" "$expires_at" "$reason" "$approved_by" || harness_die 3 "exception could not be added"
+                        printf 'Added convention exception %s\n' "$exception_id"
+                        ;;
+                    revoke)
+                        exception_id=""; reason=""; approved_by=""
+                        while [ "$#" -gt 0 ]; do case "$1" in --id) exception_id=$2; shift 2 ;; --reason) reason=$2; shift 2 ;; --by) approved_by=$2; shift 2 ;; *) harness_die 2 "unknown exception revoke option" ;; esac; done
+                        [ -n "$exception_id" ] && [ -n "$reason" ] && [ -n "$approved_by" ] || harness_die 2 "exception revoke requires --id, --reason, and --by"
+                        conventions_revoke_exception "$exception_id" "$reason" "$approved_by" || harness_die 3 "exception could not be revoked"
+                        printf 'Revoked convention exception %s\n' "$exception_id"
+                        ;;
+                    *) harness_die 2 "unknown conventions exception action: $action" ;;
+                esac
+                ;;
+            replace)
+                old_id=""; new_id=""; reason=""; approved_by=""; migration_trigger="NEW_OR_MODIFIED"; removal_date="UNSCHEDULED"
+                while [ "$#" -gt 0 ]; do case "$1" in --id) old_id=$2; shift 2 ;; --with) new_id=$2; shift 2 ;; --reason) reason=$2; shift 2 ;; --by) approved_by=$2; shift 2 ;; --trigger) migration_trigger=$2; shift 2 ;; --removal-date) removal_date=$2; shift 2 ;; *) harness_die 2 "unknown conventions replace option" ;; esac; done
+                [ -n "$old_id" ] && [ -n "$new_id" ] && [ -n "$reason" ] && [ -n "$approved_by" ] || harness_die 2 "conventions replace is missing required values"
+                conventions_replace_rule "$old_id" "$new_id" "$reason" "$approved_by" "$migration_trigger" "$removal_date" || harness_die 3 "convention replacement failed"
+                printf 'Replaced convention %s with %s\n' "$old_id" "$new_id"
+                ;;
+            deprecate)
+                rule_id=""; approved_by=""; reason=""
+                while [ "$#" -gt 0 ]; do case "$1" in --id) rule_id=$2; shift 2 ;; --by) approved_by=$2; shift 2 ;; --reason) reason=$2; shift 2 ;; *) harness_die 2 "unknown conventions deprecate option" ;; esac; done
+                [ -n "$rule_id" ] && [ -n "$approved_by" ] && [ -n "$reason" ] || harness_die 2 "conventions deprecate requires --id, --by, and --reason"
+                conventions_deprecate_rule "$rule_id" "$approved_by" "$reason" || harness_die 3 "convention rule could not be deprecated"
+                printf 'Deprecated convention %s\n' "$rule_id"
+                ;;
+            *) harness_die 2 "unknown conventions command: $sub" ;;
+        esac
+        ;;
+    inventory)
+        sub=${1:-}; [ "$#" -eq 0 ] || shift
+        [ "$sub" = "policy" ] || harness_die 2 "inventory supports only policy"
+        action=${1:-}; [ "$#" -eq 0 ] || shift
+        case "$action" in add|remove) ;; *) harness_die 2 "inventory policy supports add or remove" ;; esac
+        type=""; pattern=""; reason=""; approved_by=""
+        while [ "$#" -gt 0 ]; do case "$1" in --type) type=$2; shift 2 ;; --path) pattern=$2; shift 2 ;; --reason) reason=$2; shift 2 ;; --by) approved_by=$2; shift 2 ;; *) harness_die 2 "unknown inventory policy option" ;; esac; done
+        [ -n "$type" ] && [ -n "$pattern" ] && [ -n "$reason" ] && [ -n "$approved_by" ] || harness_die 2 "inventory policy $action requires --type, --path, --reason, and --by"
+        if [ "$action" = "add" ]; then
+            inventory_policy_add "$type" "$pattern" "$reason" "$approved_by" || harness_die 3 "inventory policy could not be added"
+            printf 'Added inventory policy %s %s\n' "$type" "$pattern"
+        else
+            inventory_policy_remove "$type" "$pattern" "$reason" "$approved_by" || harness_die 3 "inventory policy could not be removed"
+            printf 'Removed inventory policy %s %s\n' "$type" "$pattern"
+        fi
+        ;;
+    verify) verify_task || { code=$?; [ "$code" -eq 5 ] && harness_die 5 "verification failed"; harness_die 3 "verification was denied or could not run"; } ;;
+    context)
+        sub=${1:-show}; [ "$#" -eq 0 ] || shift
+        case "$sub" in
+            build) [ "$#" -eq 0 ] || harness_die 2 "context build takes no options"; context_build_active || { code=$?; [ "$code" -eq 2 ] && harness_die 2 "context build is busy"; harness_die 4 "context build could not be completed"; } ;;
+            show)
+                [ "$#" -eq 0 ] || harness_die 2 "context show takes no options"
+                context_show_active || {
+                    code=$?
+                    [ "$code" -eq 4 ] && harness_die 4 "current context generation failed integrity validation"
+                    harness_die 3 "no current context generation is available"
+                }
+                ;;
+            *) harness_die 2 "context supports build or show" ;;
+        esac
+        ;;
+    finalize) finalize_task || { code=$?; [ "$code" -eq 5 ] && harness_die 5 "verification snapshot changed"; harness_die 3 "finalization was denied"; } ;;
+    recover)
+        force_lock=0; reason=""; approved_by=""; identity_evidence=""
+        while [ "$#" -gt 0 ]; do
+            case "$1" in
+                --force-lock) force_lock=1; shift ;;
+                --reason) reason=$2; shift 2 ;;
+                --by) approved_by=$2; shift 2 ;;
+                --identity-evidence) identity_evidence=$2; shift 2 ;;
+                *) harness_die 2 "unknown recover option: $1" ;;
+            esac
+        done
+        if [ "$force_lock" = "1" ]; then
+            [ -n "$reason" ] && [ -n "$approved_by" ] || harness_die 2 "forced lock recovery requires --reason and --by"
+        elif [ -n "$reason$approved_by$identity_evidence" ]; then
+            harness_die 2 "recovery identity options require --force-lock"
+        fi
+        recover_workflow "$force_lock" "$reason" "$approved_by" "$identity_evidence" || harness_die 4 "recovery failed"
+        ;;
+    audit)
+        harness_readonly_view_begin || exit 6
+        audit_repository; code=$?
+        harness_readonly_view_end
+        [ "$code" -eq 0 ] || exit 6
+        ;;
+    doctor)
+        harness_readonly_view_begin || exit 6
+        doctor_repository; code=$?
+        harness_readonly_view_end
+        [ "$code" -eq 0 ] || exit 6
+        ;;
+    test)
+        run_public_tests "$@"
+        code=$?
+        [ "$code" -eq 0 ] && exit 0
+        [ "$code" -eq 2 ] && exit 2
+        exit 6
+        ;;
+    help|-h|--help) usage ;;
+    *) harness_die 2 "unknown command: $command_name" ;;
+esac

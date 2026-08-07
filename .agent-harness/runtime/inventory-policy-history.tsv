@@ -1,0 +1,4 @@
+REMOVE	ALLOW_SYMLINK:my_docs	External project-link mounts must be excluded, not treated as in-repository symlinks.	codex	2026-08-04T02:44:46Z
+REMOVE	EXCLUDE:my_docs	Replacing broad mount exclusion with exact policy after path inspection.	codex	2026-08-04T02:46:06Z
+REMOVE	EXCLUDE:my_docs/**	Replacing broad mount exclusion with exact policy after path inspection.	codex	2026-08-04T02:46:07Z
+REMOVE	EXCLUDE:node_modules/**	Revert exploratory exclusion after inventory review; dependency symlink handling requires a separate harness fix.	codex	2026-08-04T02:47:19Z
